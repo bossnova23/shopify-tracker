@@ -35,7 +35,7 @@ if os.environ.get('RENDER'):
         'pool_recycle': 1800,
         'pool_pre_ping': True,
         'connect_args': {
-            'sslmode': 'prefer',
+            'sslmode': 'verify-full',
             'connect_timeout': 10,
             'sslrootcert': 'system'
         }
