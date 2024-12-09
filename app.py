@@ -35,8 +35,9 @@ if os.environ.get('RENDER'):
         'pool_recycle': 1800,
         'pool_pre_ping': True,
         'connect_args': {
-            'sslmode': 'verify-full',
-            'connect_timeout': 10
+            'sslmode': 'prefer',
+            'connect_timeout': 10,
+            'sslrootcert': 'system'
         }
     }
 else:
@@ -44,6 +45,8 @@ else:
     app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///shopify_tracker.db'
 
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Initialize SQLAlchemy after all configurations
 db = SQLAlchemy(app)
 
 # Add error handling for database operations
