@@ -15,10 +15,19 @@ load_dotenv()
 
 app = Flask(__name__, static_folder='static')
 
-# Use PostgreSQL in production, SQLite in development
+# Database configuration
 if os.environ.get('RENDER'):
-    app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', '').replace('postgres://', 'postgresql://')
+    # Use PostgreSQL in production
+    database_url = os.environ.get('DATABASE_URL')
+    if database_url:
+        # Render adds postgres:// instead of postgresql://
+        database_url = database_url.replace('postgres://', 'postgresql://')
+    else:
+        # Fallback to SQLite if no DATABASE_URL is set
+        database_url = 'sqlite:///shopify_tracker.db'
+    app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 else:
+    # Use SQLite in development
     app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///shopify_tracker.db'
 
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
