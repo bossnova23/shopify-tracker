@@ -6,6 +6,8 @@ import requests
 from datetime import datetime
 import urllib.parse
 import logging
+from sqlalchemy import create_engine
+from sqlalchemy.pool import QueuePool
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -22,16 +24,19 @@ if os.environ.get('RENDER'):
     if database_url:
         # Render adds postgres:// instead of postgresql://
         database_url = database_url.replace('postgres://', 'postgresql://')
-        # Add SSL mode
-        database_url += '?sslmode=require'
     else:
         # Fallback to SQLite if no DATABASE_URL is set
         database_url = 'sqlite:///shopify_tracker.db'
+    
     app.config['SQLALCHEMY_DATABASE_URI'] = database_url
-    # Add SSL configuration
     app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-        "connect_args": {
-            "sslmode": "require"
+        'pool_size': 5,
+        'pool_timeout': 30,
+        'pool_recycle': 1800,
+        'pool_pre_ping': True,
+        'connect_args': {
+            'sslmode': 'verify-full',
+            'connect_timeout': 10
         }
     }
 else:
@@ -41,6 +46,21 @@ else:
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
+# Add error handling for database operations
+def handle_db_operation(operation):
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            return operation()
+        except Exception as e:
+            retry_count += 1
+            logger.error(f"Database operation failed (attempt {retry_count}/{max_retries}): {str(e)}")
+            if retry_count == max_retries:
+                raise
+            db.session.rollback()
+    
 # Models
 class Store(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -92,56 +112,60 @@ def track_product():
         response = requests.get(url, timeout=10)
         data_json = response.json()
         
-        # Get or create store
-        store = Store.query.filter_by(domain=domain).first()
-        if not store:
-            store = Store(
-                domain=domain,
-                track_start=datetime.today().strftime('%m-%d-%y'),
-                total_sales=0.0,
-                week_sales=0.0
+        def db_operation():
+            # Get or create store
+            store = Store.query.filter_by(domain=domain).first()
+            if not store:
+                store = Store(
+                    domain=domain,
+                    track_start=datetime.today().strftime('%m-%d-%y'),
+                    total_sales=0.0,
+                    week_sales=0.0
+                )
+                db.session.add(store)
+                db.session.commit()
+            
+            # Check if product already exists
+            existing_product = Product.query.filter_by(
+                store_id=store.id,
+                handle=data_json["product"]['handle']
+            ).first()
+            
+            if existing_product:
+                return {
+                    "status": "error",
+                    "message": "Product is already being tracked"
+                }
+            
+            # Create new product
+            new_product = Product(
+                store_id=store.id,
+                title=data_json["product"]['title'],
+                handle=data_json["product"]['handle'],
+                bought=data_json["product"]['updated_at'],
+                post=data_json["product"]['published_at'],
+                image=data_json["product"]["images"][0]["src"],
+                price=float(data_json["product"]["variants"][0]["price"]),
+                total_price=0.0,
+                total_sales=0,
+                track_start=datetime.today().strftime('%m-%d-%y')
             )
-            db.session.add(store)
+            
+            db.session.add(new_product)
             db.session.commit()
-        
-        # Check if product already exists
-        existing_product = Product.query.filter_by(
-            store_id=store.id,
-            handle=data_json["product"]['handle']
-        ).first()
-        
-        if existing_product:
-            return jsonify({
-                "status": "error",
-                "message": "Product is already being tracked"
-            })
-        
-        # Create new product
-        new_product = Product(
-            store_id=store.id,
-            title=data_json["product"]['title'],
-            handle=data_json["product"]['handle'],
-            bought=data_json["product"]['updated_at'],
-            post=data_json["product"]['published_at'],
-            image=data_json["product"]["images"][0]["src"],
-            price=float(data_json["product"]["variants"][0]["price"]),
-            total_price=0.0,
-            total_sales=0,
-            track_start=datetime.today().strftime('%m-%d-%y')
-        )
-        
-        db.session.add(new_product)
-        db.session.commit()
-        
-        return jsonify({
-            "status": "success",
-            "message": "Product tracking started",
-            "data": {
-                "title": new_product.title,
-                "price": new_product.price,
-                "track_start": new_product.track_start
+            
+            return {
+                "status": "success",
+                "message": "Product tracking started",
+                "data": {
+                    "title": new_product.title,
+                    "price": new_product.price,
+                    "track_start": new_product.track_start
+                }
             }
-        })
+        
+        result = handle_db_operation(db_operation)
+        return jsonify(result)
         
     except Exception as e:
         logger.error(f'Error tracking product: {str(e)}')
@@ -157,34 +181,38 @@ def get_store_data():
         website = request.args.get('website')
         domain = website.replace("https://", "").replace("/", "")
         
-        store = Store.query.filter_by(domain=domain).first()
-        
-        if not store:
-            return jsonify({
-                "status": "error",
-                "message": "Store not found"
-            })
-        
-        products = Product.query.filter_by(store_id=store.id).all()
-        products_data = [{
-            "title": p.title,
-            "handle": p.handle,
-            "image": p.image,
-            "price": p.price,
-            "total_price": p.total_price,
-            "total_sales": p.total_sales,
-            "track_start": p.track_start
-        } for p in products]
-        
-        return jsonify({
-            "status": "success",
-            "data": {
-                "track_start": store.track_start,
-                "total_sales": store.total_sales,
-                "week_sales": store.week_sales,
-                "products": products_data
+        def db_operation():
+            store = Store.query.filter_by(domain=domain).first()
+            
+            if not store:
+                return {
+                    "status": "error",
+                    "message": "Store not found"
+                }
+            
+            products = Product.query.filter_by(store_id=store.id).all()
+            products_data = [{
+                "title": p.title,
+                "handle": p.handle,
+                "image": p.image,
+                "price": p.price,
+                "total_price": p.total_price,
+                "total_sales": p.total_sales,
+                "track_start": p.track_start
+            } for p in products]
+            
+            return {
+                "status": "success",
+                "data": {
+                    "track_start": store.track_start,
+                    "total_sales": store.total_sales,
+                    "week_sales": store.week_sales,
+                    "products": products_data
+                }
             }
-        })
+        
+        result = handle_db_operation(db_operation)
+        return jsonify(result)
         
     except Exception as e:
         logger.error(f'Error getting store data: {str(e)}')
@@ -202,34 +230,38 @@ def get_product_data():
         handle_id = product_link.split("/products/")[1].split('?')[0]
         domain = product_link.split("/")[2]
         
-        store = Store.query.filter_by(domain=domain).first()
-        if not store:
-            return jsonify({
-                "status": "error",
-                "message": "Store not found"
-            })
+        def db_operation():
+            store = Store.query.filter_by(domain=domain).first()
+            if not store:
+                return {
+                    "status": "error",
+                    "message": "Store not found"
+                }
+                
+            product = Product.query.filter_by(store_id=store.id, handle=handle_id).first()
+            if not product:
+                return {
+                    "status": "error",
+                    "message": "Product not found"
+                }
             
-        product = Product.query.filter_by(store_id=store.id, handle=handle_id).first()
-        if not product:
-            return jsonify({
-                "status": "error",
-                "message": "Product not found"
-            })
-        
-        return jsonify({
-            "status": "success",
-            "data": {
-                "title": product.title,
-                "handle": product.handle,
-                "image": product.image,
-                "price": product.price,
-                "total_price": product.total_price,
-                "total_sales": product.total_sales,
-                "track_start": product.track_start,
-                "bought": product.bought,
-                "post": product.post
+            return {
+                "status": "success",
+                "data": {
+                    "title": product.title,
+                    "handle": product.handle,
+                    "image": product.image,
+                    "price": product.price,
+                    "total_price": product.total_price,
+                    "total_sales": product.total_sales,
+                    "track_start": product.track_start,
+                    "bought": product.bought,
+                    "post": product.post
+                }
             }
-        })
+        
+        result = handle_db_operation(db_operation)
+        return jsonify(result)
         
     except Exception as e:
         logger.error(f'Error getting product data: {str(e)}')
