@@ -22,10 +22,18 @@ if os.environ.get('RENDER'):
     if database_url:
         # Render adds postgres:// instead of postgresql://
         database_url = database_url.replace('postgres://', 'postgresql://')
+        # Add SSL mode
+        database_url += '?sslmode=require'
     else:
         # Fallback to SQLite if no DATABASE_URL is set
         database_url = 'sqlite:///shopify_tracker.db'
     app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+    # Add SSL configuration
+    app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+        "connect_args": {
+            "sslmode": "require"
+        }
+    }
 else:
     # Use SQLite in development
     app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///shopify_tracker.db'
